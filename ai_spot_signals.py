@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from sklearn.ensemble import RandomForestClassifier
 import pickle
 import os
 import time
 from datetime import datetime, timedelta
+from sklearn.ensemble import RandomForestClassifier
 
 # ====== المجلدات ======
 CACHE = "cache"
@@ -19,38 +19,50 @@ for folder in [CACHE, MODEL, HISTORICAL]:
         os.makedirs(folder)
 
 # ===============================
-# جلب أفضل العملات من CoinGecko بما فيها USDC
+# جلب أفضل العملات مع fallback بين مصادر متعددة
 # ===============================
 def get_top_symbols(limit=20):
-    try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {"vs_currency":"usd","order":"volume_desc","per_page":limit,"page":1}
-        data = requests.get(url, params=params, timeout=10).json()
-        symbols = [item["symbol"].upper() for item in data]
-        return symbols
-    except:
-        return []
+    sources = [
+        lambda: requests.get("https://api.coingecko.com/api/v3/coins/markets",
+                             params={"vs_currency":"usd","order":"volume_desc","per_page":limit,"page":1}, timeout=10).json(),
+        lambda: requests.get("https://api.coinpaprika.com/v1/tickers", timeout=10).json()
+    ]
+    symbols = []
+    for source in sources:
+        try:
+            data = source()
+            if isinstance(data, list):
+                for item in data[:limit]:
+                    if "symbol" in item:
+                        symbols.append(item["symbol"].upper())
+                    elif "id" in item:
+                        symbols.append(item["id"].upper())
+                if symbols:
+                    break
+        except:
+            continue
+    return symbols[:limit]
 
 # ===============================
-# جلب بيانات OHLCV من CryptoCompare مع fallback لCoinGecko
+# جلب بيانات OHLCV مع fallback
 # ===============================
 def fetch_ohlcv(symbol, interval="4h", limit=200):
-    base = "https://min-api.cryptocompare.com/data/v2/"
-    fsym = symbol
-    tsym = "USDT"
-    url = f"{base}{'histohour' if interval=='4h' else 'histoday'}?fsym={fsym}&tsym={tsym}&limit={limit}"
+    df = pd.DataFrame()
+    # Primary: CryptoCompare
     try:
+        base = "https://min-api.cryptocompare.com/data/v2/"
+        url = f"{base}{'histohour' if interval=='4h' else 'histoday'}?fsym={symbol}&tsym=USDT&limit={limit}"
         data = requests.get(url).json()
-        if data.get("Response") == "Success":
+        if data.get("Response")=="Success":
             df = pd.DataFrame(data["Data"]["Data"])
             hist_file = os.path.join(HISTORICAL, f"{symbol}_{interval}.csv")
-            df.to_csv(hist_file, index=False)
+            df.to_csv(hist_file,index=False)
             return df
     except:
         pass
 
-    # لو فشل CryptoCompare (خصوصاً Daily)، نجرب CoinGecko
-    if interval == "daily":
+    # Fallback: CoinGecko
+    if interval=="daily":
         try:
             cg_url = f"https://api.coingecko.com/api/v3/coins/{symbol.lower()}/market_chart"
             params = {"vs_currency":"usd","days":limit,"interval":"daily"}
@@ -65,10 +77,23 @@ def fetch_ohlcv(symbol, interval="4h", limit=200):
         except:
             pass
 
-    return pd.DataFrame()
+    # Fallback: CoinPaprika
+    try:
+        url = f"https://api.coinpaprika.com/v1/coins/{symbol.lower()}-usd/ohlcv/historical"
+        params = {"limit":limit}
+        data = requests.get(url, params=params).json()
+        if isinstance(data, list) and data:
+            df = pd.DataFrame(data)
+            df.rename(columns={"close":"close","high":"high","low":"low","open":"open","time_close":"time"}, inplace=True)
+            df["time"] = pd.to_datetime(df["time"])
+            return df
+    except:
+        pass
+
+    return df
 
 # ===============================
-# إضافة المؤشرات + ATR حقيقي
+# إضافة المؤشرات + ATR ودعم/مقاومة
 # ===============================
 def add_indicators(df):
     df["close"] = df["close"].astype(float)
@@ -83,6 +108,9 @@ def add_indicators(df):
     df["TR"] = df[["tr1","tr2","tr3"]].max(axis=1)
     df["ATR"] = df["TR"].ewm(alpha=1/14, adjust=False).mean()
     df["return"] = df["close"].pct_change()
+    # دعم ومقاومة
+    df["support"] = df["low"].rolling(20).min()
+    df["resistance"] = df["high"].rolling(20).max()
     return df.dropna()
 
 # ===============================
@@ -108,31 +136,6 @@ def train_ai(df, symbol):
         return 0
 
 # ===============================
-# إعادة تدريب AI أسبوعيًا
-# ===============================
-def weekly_retrain():
-    if not os.path.exists(TRADE_LOG):
-        return
-    df = pd.read_csv(TRADE_LOG)
-    if df.empty:
-        return
-    last_train_file = os.path.join(CACHE,"last_train.txt")
-    if os.path.exists(last_train_file):
-        with open(last_train_file,"r") as f:
-            last_train_date = datetime.fromisoformat(f.read().strip())
-        if datetime.now() - last_train_date < timedelta(days=7):
-            return
-    symbols = df["العملة"].unique()
-    for sym in symbols:
-        hist_file = os.path.join(HISTORICAL, f"{sym}_daily.csv")
-        if os.path.exists(hist_file):
-            df_hist = pd.read_csv(hist_file)
-            df_hist = add_indicators(df_hist)
-            train_ai(df_hist, sym)
-    with open(last_train_file,"w") as f:
-        f.write(datetime.now().isoformat())
-
-# ===============================
 # حالة السوق لعملة
 # ===============================
 def market_condition(symbol):
@@ -141,43 +144,15 @@ def market_condition(symbol):
         return "غير متاح"
     df = add_indicators(df)
     last = df.iloc[-1]
-    if last["close"] > last["EMA50"] > last["EMA200"]:
+    if last["EMA50"] > last["EMA200"] and last["close"] > last["EMA50"]:
         return "صاعد"
-    elif last["close"] < last["EMA50"] < last["EMA200"]:
+    elif last["EMA50"] < last["EMA200"] and last["close"] < last["EMA50"]:
         return "هابط"
     else:
         return "عرضي"
 
 # ===============================
-# حالة السوق العام
-# ===============================
-def overall_market(symbols):
-    counts = {"صاعد":0,"هابط":0,"عرضي":0}
-    for s in symbols:
-        state = market_condition(s)
-        if state in counts:
-            counts[state] += 1
-    total = sum(counts.values())
-    if total == 0:
-        return "غير متاح"
-    best = max(counts, key=lambda k: counts[k])
-    return f"{best} ({counts[best]}/{total})"
-
-# ===============================
-# تسجيل الصفقة
-# ===============================
-def log_trade(trade):
-    if not os.path.exists(TRADE_LOG):
-        df = pd.DataFrame(columns=list(trade.keys()))
-        df = df.append(trade, ignore_index=True)
-        df.to_csv(TRADE_LOG, index=False)
-    else:
-        df = pd.read_csv(TRADE_LOG)
-        df = df.append(trade, ignore_index=True)
-        df.to_csv(TRADE_LOG, index=False)
-
-# ===============================
-# توليد الإشارة مع تسجيل كل الإشارات
+# توليد الإشارة مع إشارات تقاطع EMA
 # ===============================
 def generate_signal(symbol):
     df4h = fetch_ohlcv(symbol,"4h",200)
@@ -188,6 +163,7 @@ def generate_signal(symbol):
 
     df = add_indicators(df4h)
     last = df.iloc[-1]
+
     dfd = fetch_ohlcv(symbol,"daily",200)
     if dfd.empty:
         return {"العملة": symbol, "دخول": np.nan, "وقف": np.nan, "هدف": np.nan,
@@ -195,10 +171,14 @@ def generate_signal(symbol):
                 "حالة الإشارة": "مرفوض", "سبب": "بيانات يومية غير متاحة"}
 
     dfd = add_indicators(dfd)
-    if last["close"] < dfd["EMA50"].iloc[-1] and last["close"] < dfd["EMA200"].iloc[-1]:
-        return {"العملة": symbol, "دخول": np.nan, "وقف": np.nan, "هدف": np.nan,
-                "احتمال_الصعود": np.nan, "حالة_السوق": np.nan,
-                "حالة الإشارة": "مرفوض", "سبب": "السعر تحت EMA50 و EMA200 يومي"}
+    last_daily = dfd.iloc[-1]
+
+    # إشارات تقاطع EMA
+    cross_signal = ""
+    if dfd["EMA50"].iloc[-2] < dfd["EMA200"].iloc[-2] and dfd["EMA50"].iloc[-1] > dfd["EMA200"].iloc[-1]:
+        cross_signal = "صاعد"
+    elif dfd["EMA50"].iloc[-2] > dfd["EMA200"].iloc[-2] and dfd["EMA50"].iloc[-1] < dfd["EMA200"].iloc[-1]:
+        cross_signal = "هابط"
 
     prob = train_ai(df,symbol)
     entry = last["close"]
@@ -206,12 +186,12 @@ def generate_signal(symbol):
     stop = entry - atr*1.2
     target = entry + atr*1.8
 
-    if prob < 0.55:
+    if prob < 0.55 and not cross_signal:
         trade_status = "مرفوض"
         reason = f"قوة AI ضعيفة ({round(prob*100,2)}%)"
     else:
         trade_status = "مقبول"
-        reason = ""
+        reason = f"إشارة تقاطع EMA" if cross_signal else f"قوة AI قوية ({round(prob*100,2)}%)"
 
     trade = {"العملة":symbol, "تاريخ":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
              "دخول":round(entry,4) if trade_status=="مقبول" else np.nan,
@@ -219,16 +199,26 @@ def generate_signal(symbol):
              "هدف":round(target,4) if trade_status=="مقبول" else np.nan,
              "احتمال_الصعود":round(prob*100,2),
              "حالة_السوق":market_condition(symbol),
+             "دعم": round(last_daily["support"],4),
+             "مقاومة": round(last_daily["resistance"],4),
              "حالة الإشارة": trade_status,
              "سبب": reason}
-    log_trade(trade)
+    # تسجيل الصفقة
+    if not os.path.exists(TRADE_LOG):
+        df_log = pd.DataFrame(columns=list(trade.keys()))
+        df_log = df_log.append(trade, ignore_index=True)
+        df_log.to_csv(TRADE_LOG,index=False)
+    else:
+        df_log = pd.read_csv(TRADE_LOG)
+        df_log = df_log.append(trade, ignore_index=True)
+        df_log.to_csv(TRADE_LOG,index=False)
+
     return trade
 
 # ===============================
-# سكان السوق مع ترقيم من 1
+# سكان السوق تلقائي
 # ===============================
 def scan_market():
-    weekly_retrain()
     symbols = get_top_symbols(20)
     results = []
     for s in symbols:
@@ -244,21 +234,21 @@ def scan_market():
     return df
 
 # ===============================
-# واجهة Streamlit بدون جدول فاضي عند الفتح
+# Streamlit Interface
 # ===============================
 st.markdown('<h4 style="font-size:16px;">AI Spot Scanner</h4>', unsafe_allow_html=True)
-symbols = get_top_symbols(20)
-st.markdown(f"### 🧭 حالة السوق العام: {overall_market(symbols)}")
+
+# فحص السوق أوتوماتيك
+df = scan_market()
+st.markdown(f"### 🧭 حالة السوق العام: {', '.join(df['حالة_السوق'].dropna().unique())}")
 
 def highlight_rows(row):
     color = 'background-color: #d4f8d4' if row.get('حالة الإشارة')=='مقبول' else 'background-color: #f8d4d4'
     return [color]*len(row)
 
-# زرار لإعادة الفحص يدويًا
-if st.button("🔍 فحص السوق مرة أخرى"):
-    df = scan_market()
-    st.dataframe(df.style.apply(highlight_rows, axis=1))
-    if (df["حالة الإشارة"]=="مقبول").any():
-        st.success("تم تسجيل الصفقات وتحسين ترتيب الإشارات!")
-    else:
-        st.info("لم يتم تسجيل أي صفقة جديدة، لكن تم فحص السوق!")
+st.dataframe(df.style.apply(highlight_rows, axis=1))
+
+if (df["حالة الإشارة"]=="مقبول").any():
+    st.success("تم تسجيل الصفقات وتحسين ترتيب الإشارات!")
+else:
+    st.info("لم يتم تسجيل أي صفقة جديدة، لكن تم فحص السوق!")
