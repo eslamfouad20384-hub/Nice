@@ -26,13 +26,13 @@ def get_top_symbols(limit=20):
         url = "https://api.coingecko.com/api/v3/coins/markets"
         params = {"vs_currency":"usd","order":"volume_desc","per_page":limit,"page":1}
         data = requests.get(url, params=params, timeout=10).json()
-        symbols = [item["symbol"].upper() for item in data]  # كل العملات بدون USDT
+        symbols = [item["symbol"].upper() for item in data]
         return symbols
     except:
         return []
 
 # ===============================
-# جلب بيانات OHLCV من CryptoCompare
+# جلب بيانات OHLCV من CryptoCompare مع fallback لCoinGecko
 # ===============================
 def fetch_ohlcv(symbol, interval="4h", limit=200):
     base = "https://min-api.cryptocompare.com/data/v2/"
@@ -41,13 +41,30 @@ def fetch_ohlcv(symbol, interval="4h", limit=200):
     url = f"{base}{'histohour' if interval=='4h' else 'histoday'}?fsym={fsym}&tsym={tsym}&limit={limit}"
     try:
         data = requests.get(url).json()
-        if data["Response"] == "Success":
+        if data.get("Response") == "Success":
             df = pd.DataFrame(data["Data"]["Data"])
             hist_file = os.path.join(HISTORICAL, f"{symbol}_{interval}.csv")
             df.to_csv(hist_file, index=False)
             return df
     except:
         pass
+
+    # لو فشل CryptoCompare (خصوصاً Daily)، نجرب CoinGecko
+    if interval == "daily":
+        try:
+            cg_url = f"https://api.coingecko.com/api/v3/coins/{symbol.lower()}/market_chart"
+            params = {"vs_currency":"usd","days":limit,"interval":"daily"}
+            data = requests.get(cg_url, params=params).json()
+            if "prices" in data:
+                df = pd.DataFrame(data["prices"], columns=["time","close"])
+                df["time"] = pd.to_datetime(df["time"], unit="ms")
+                df["high"] = df["close"]
+                df["low"] = df["close"]
+                df["open"] = df["close"]
+                return df
+        except:
+            pass
+
     return pd.DataFrame()
 
 # ===============================
